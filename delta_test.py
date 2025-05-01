@@ -11,8 +11,8 @@ class DeltaRobot:
                  upper_base_radius: float = 190.0,
                  effector_radius: float = 70.0,
                  initial_angle: float = 45.0 * (math.pi / 180.0),  # 45 degrees in radians
-                 motor_min_rot: float = 0.0,
-                 motor_max_rot: float = 0.5):
+                 motor_min_angle: float = -30.0 * (math.pi / 180.0),  # Minimum motor angle in radians
+                 motor_max_angle: float = 30.0 * (math.pi / 180.0)):  # Maximum motor angle in radians
         
         # Delta robot parameters
         self.upper_arm_length = upper_arm_length  # Length of the upper arm (mm)
@@ -21,9 +21,9 @@ class DeltaRobot:
         self.effector_radius = effector_radius  # Radius of the end effector (mm)
         self.initial_angle = initial_angle  # Initial angle between upper arm and horizontal (radians)
         
-        # Motor rotation limits (mm)
-        self.motor_min_rot = motor_min_rot
-        self.motor_max_rot = motor_max_rot
+        # Motor angle limits (radians)
+        self.motor_min_angle = motor_min_angle
+        self.motor_max_angle = motor_max_angle
         
         # Calculate the position of motor joints in base reference frame
         self.base_joints = []
@@ -42,6 +42,15 @@ class DeltaRobot:
             y = self.effector_radius * math.sin(angle)
             z = 0
             self.effector_joints.append((x, y, z))
+        
+        # Steps per revolution for the stepper motors
+        self.steps_per_rev = 200  # Typical for many stepper motors
+        
+        # Microstepping setting
+        self.microsteps = 16  # Common microstepping setting
+        
+        # Total steps per revolution with microstepping
+        self.total_steps_per_rev = self.steps_per_rev * self.microsteps
         
         # Calculate work envelope
         self.calculate_work_envelope()
@@ -78,6 +87,9 @@ class DeltaRobot:
         try:
             self.serial_connection = serial.Serial(port, baud_rate, timeout=1)
             print(f"Connected to {port} at {baud_rate} baud")
+            # Send initial configuration to GRBL controller
+            self.send_gcode("$X")  # Unlock
+            time.sleep(0.5)
             return True
         except serial.SerialException as e:
             print(f"Error connecting to serial port: {e}")
@@ -86,7 +98,8 @@ class DeltaRobot:
     def send_gcode(self, command):
         """Send G-code command to the CNC shield."""
         if self.serial_connection and self.serial_connection.is_open:
-            self.serial_connection.write(f"{command}\n".encode())
+            command_with_newline = f"{command}\n"
+            self.serial_connection.write(command_with_newline.encode())
             # Wait for response/acknowledgment
             response = self.serial_connection.readline().decode().strip()
             print(f"Sent: {command} | Response: {response}")
@@ -97,10 +110,10 @@ class DeltaRobot:
     
     def inverse_kinematics(self, x: float, y: float, z: float) -> List[float]:
         """
-        Calculate motor positions required to position end effector at (x,y,z).
-        Returns a list of the three motor positions.
+        Calculate motor angles required to position end effector at (x,y,z).
+        Returns a list of the three motor angles in radians.
         """
-        motor_positions = []
+        motor_angles = []
         
         for i in range(3):
             # Position of the i-th base joint
@@ -111,80 +124,80 @@ class DeltaRobot:
             effector_y = y + self.effector_joints[i][1]
             effector_z = z + self.effector_joints[i][2]
             
-            # Vector from base joint to effector joint
+            # Calculate the horizontal distance from base joint to end effector joint
             dx = effector_x - base_x
             dy = effector_y - base_y
+            horizontal_dist = math.sqrt(dx*dx + dy*dy)
+            
+            # Calculate vertical distance
             dz = effector_z - base_z
             
-            # Distance between base and effector joints (squared)
-            distance_squared = dx**2 + dy**2 + dz**2
+            # Calculate elbow-to-effector horizontal distance
+            horizontal_offset = horizontal_dist - self.upper_base_radius + self.effector_radius
             
-            # Using the law of cosines to calculate the angle
-            cos_angle = (self.upper_arm_length**2 + distance_squared - self.lower_arm_length**2) / (2 * self.upper_arm_length * math.sqrt(distance_squared))
+            # Using law of cosines to calculate the upper arm angle
+            # First, calculate the distance from motor joint to effector joint
+            F = math.sqrt(horizontal_offset*horizontal_offset + dz*dz)
             
-            # Clamping cos_angle to avoid domain errors (due to floating point inaccuracies)
-            cos_angle = max(-1.0, min(1.0, cos_angle))
+            # Using law of cosines to find angle
+            cos_theta = (self.upper_arm_length*self.upper_arm_length + F*F - self.lower_arm_length*self.lower_arm_length) / (2 * self.upper_arm_length * F)
             
-            # Calculate the angle
-            angle = math.acos(cos_angle)
+            # Clamp to avoid domain errors
+            cos_theta = max(-1.0, min(1.0, cos_theta))
             
-            # Convert angle to motor position (simplified)
-            # Here we map the angle to a motor position between min and max values
-            # This is a simplified approach - in reality, you'd need more precise mapping
-            # based on your specific mechanical setup
-            angle_normalized = angle / math.pi  # normalize to [0,1] range
-            motor_pos = self.motor_min_rot + angle_normalized * (self.motor_max_rot - self.motor_min_rot)
+            # Calculate the angle between upper arm and horizontal line
+            theta1 = math.acos(cos_theta)
             
-            motor_positions.append(motor_pos)
+            # Calculate the angle between F and horizontal line
+            alpha = math.atan2(dz, horizontal_offset)
+            
+            # Final motor angle (deviation from initial position)
+            motor_angle = alpha - theta1 - self.initial_angle
+            
+            # Check if angle is within limits
+            if motor_angle < self.motor_min_angle or motor_angle > self.motor_max_angle:
+                print(f"Warning: Motor {i+1} angle {math.degrees(motor_angle):.2f}° is outside limits "
+                      f"[{math.degrees(self.motor_min_angle):.2f}°, {math.degrees(self.motor_max_angle):.2f}°]")
+            
+            motor_angles.append(motor_angle)
         
-        return motor_positions
+        return motor_angles
     
-    def generate_random_position(self) -> Tuple[float, float, float]:
-        """Generate a random position within the work envelope."""
-        # Choose a random z value within the safe range
-        z = random.uniform(self.z_min * 0.8, self.z_max * 0.8)  # Use 80% of range for safety
-        
-        # The allowed xy radius depends on the z height - simplified calculation
-        max_radius = self.xy_radius_at_z0 * (1 - abs(z / self.z_min) * 0.5)
-        
-        # Choose random angle and radius
-        angle = random.uniform(0, 2 * math.pi)
-        radius = random.uniform(0, max_radius)
-        
-        # Convert to cartesian coordinates
-        x = radius * math.cos(angle)
-        y = radius * math.sin(angle)
-        
-        return x, y, z
+    def angles_to_steps(self, angles):
+        """Convert motor angles to stepper motor steps."""
+        steps = []
+        for angle in angles:
+            # Convert angle to steps
+            # Full circle is 2*pi radians which corresponds to steps_per_rev steps
+            steps_float = angle * self.total_steps_per_rev / (2 * math.pi)
+            steps.append(int(round(steps_float)))
+        return steps
     
-    def generate_random_gcode(self) -> str:
-        """Generate a G-code command for a random position within the work envelope."""
-        x, y, z = self.generate_random_position()
-        return f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F1000"
-    
-    def calculate_motor_positions(self, x: float, y: float, z: float) -> str:
+    def calculate_motor_commands(self, x: float, y: float, z: float) -> str:
         """Calculate motor positions and return as G-code string."""
-        motor_pos = self.inverse_kinematics(x, y, z)
-        return f"G1 X{motor_pos[0]:.4f} Y{motor_pos[1]:.4f} Z{motor_pos[2]:.4f} F1000"
+        # Get the angles for each motor
+        motor_angles = self.inverse_kinematics(x, y, z)
+        
+        # Convert angles to steps
+        steps = self.angles_to_steps(motor_angles)
+        
+        # Format as G-code
+        return f"G1 X{steps[0]} Y{steps[1]} Z{steps[2]} F1000"
     
-    def run_random_movements(self, count: int = 10, delay: float = 2.0):
-        """Generate and execute a series of random movements."""
-        if not self.serial_connection:
-            print("Serial connection not established. Connect first.")
-            return
+    def move_to_position(self, x: float, y: float, z: float, feed_rate: float = 1000):
+        """Move to a specific XYZ position."""
+        print(f"Moving to position: X={x:.2f}, Y={y:.2f}, Z={z:.2f}")
         
-        # Home the machine first
-        self.send_gcode("G28")  # Home all axes
-        time.sleep(1)
+        # Calculate motor commands
+        gcode = self.calculate_motor_commands(x, y, z)
         
-        for i in range(count):
-            x, y, z = self.generate_random_position()
-            gcode = self.calculate_motor_positions(x, y, z)
-            
-            print(f"Movement {i+1}/{count}: Target position: X={x:.2f}, Y={y:.2f}, Z={z:.2f}")
-            self.send_gcode(gcode)
-            time.sleep(delay)
-            
+        # Add feed rate
+        if "F" not in gcode:
+            gcode += f" F{feed_rate}"
+        
+        # Send the command
+        self.send_gcode(gcode)
+    
     def move_in_circle(self, radius: float, z_height: float, steps: int = 50, revolutions: float = 1.0, delay: float = 0.05):
         """
         Move the end effector in a horizontal circular path.
@@ -219,8 +232,7 @@ class DeltaRobot:
         # Initial move to the starting position of the circle
         start_x = radius  # Start at (radius, 0)
         start_y = 0
-        gcode = self.calculate_motor_positions(start_x, start_y, z_height)
-        self.send_gcode(gcode)
+        self.move_to_position(start_x, start_y, z_height)
         time.sleep(1)  # Give time to reach the starting position
         
         # Calculate total number of steps
@@ -235,11 +247,8 @@ class DeltaRobot:
             x = radius * math.cos(angle)
             y = radius * math.sin(angle)
             
-            # Calculate motor positions via inverse kinematics
-            gcode = self.calculate_motor_positions(x, y, z_height)
-            
-            # Send the command
-            self.send_gcode(gcode)
+            # Move to the position
+            self.move_to_position(x, y, z_height)
             
             # Wait for the specified delay
             time.sleep(delay)
@@ -251,83 +260,6 @@ class DeltaRobot:
         
         print("Circular movement completed")
     
-    def move_in_smooth_circle(self, radius: float, z_height: float, feed_rate: float = 500, revolutions: float = 1.0):
-        """
-        Move the end effector in a smooth horizontal circular path using arc movement commands.
-        This uses G2/G3 arc commands for smoother motion if your controller supports them.
-        
-        Args:
-            radius (float): Radius of the circle in mm
-            z_height (float): Fixed Z height for the circular movement
-            feed_rate (float): Speed of movement in mm/min
-            revolutions (float): Number of complete revolutions to perform
-        """
-        if not self.serial_connection:
-            print("Serial connection not established. Connect first.")
-            return
-            
-        # Safety check - make sure the requested circle is within the work envelope
-        if radius > self.xy_radius_at_z0 or z_height < self.z_min or z_height > self.z_max:
-            print(f"WARNING: Requested circle (radius={radius}, z={z_height}) may be outside work envelope.")
-            print(f"Maximum recommended radius at z=0: {self.xy_radius_at_z0:.2f}mm")
-            print(f"Z range: {self.z_min:.2f}mm to {self.z_max:.2f}mm")
-            response = input("Continue anyway? (y/n): ")
-            if response.lower() != 'y':
-                return
-        
-        print(f"Moving in a smooth circle of radius {radius}mm at height {z_height}mm")
-        print(f"Performing {revolutions} revolutions at {feed_rate} mm/min")
-        
-        # Home the machine first
-        self.send_gcode("G28")  # Home all axes
-        time.sleep(1)
-        
-        # Set to absolute positioning mode
-        self.send_gcode("G90")
-        
-        # Initial move to the starting position of the circle
-        start_x = radius  # Start at (radius, 0)
-        start_y = 0
-        
-        # Calculate motor positions for the starting point
-        motor_pos = self.inverse_kinematics(start_x, start_y, z_height)
-        self.send_gcode(f"G1 X{motor_pos[0]:.4f} Y{motor_pos[1]:.4f} Z{motor_pos[2]:.4f} F{feed_rate}")
-        time.sleep(2)  # Give time to reach the starting position
-        
-        # For multiple revolutions, we'll do them one at a time
-        for rev in range(int(revolutions)):
-            print(f"Starting revolution {rev+1}/{int(revolutions)}")
-            
-            # For each revolution, we'll do a full circle using G2 (clockwise) or G3 (counterclockwise)
-            # We need to convert the end points of the arc to motor positions
-            
-            # We're already at (radius, 0), and a full circle ends at the same point
-            # For the CNC to recognize this as a full circle, we typically need I and J values
-            # I is the X-offset to the center, J is the Y-offset to the center
-            
-            # Since we're starting at (radius, 0), the center is at (0, 0) from our position
-            # So I = -radius (X offset to center) and J = 0 (Y offset to center)
-            
-            # We need to send the end point in motor coordinates
-            end_x = radius  # Same as start for a full circle
-            end_y = 0
-            end_motor_pos = self.inverse_kinematics(end_x, end_y, z_height)
-            
-            # Use G3 for counterclockwise movement (standard for most CNC controllers)
-            # Note: The I and J values are in the workspace coordinates, not motor coordinates
-            self.send_gcode(f"G3 X{end_motor_pos[0]:.4f} Y{end_motor_pos[1]:.4f} Z{end_motor_pos[2]:.4f} I{-radius:.4f} J0 F{feed_rate}")
-            
-            # Wait for the move to complete
-            # This is a simplified approach - in a real system, you might want to check for completion signals
-            # Estimate time based on circle circumference and feed rate
-            circumference = 2 * math.pi * radius  # mm
-            estimated_time = (circumference / feed_rate) * 60  # seconds
-            
-            print(f"Estimated time for revolution: {estimated_time:.2f} seconds")
-            time.sleep(estimated_time + 1)  # Add a small buffer
-        
-        print("Circular movement completed")
-        
     def move_in_spiral(self, start_radius: float, end_radius: float, z_height: float, 
                      steps: int = 200, revolutions: float = 2.0, delay: float = 0.05):
         """
@@ -365,8 +297,7 @@ class DeltaRobot:
         # Initial move to the starting position of the spiral
         start_x = start_radius  # Start at (start_radius, 0)
         start_y = 0
-        gcode = self.calculate_motor_positions(start_x, start_y, z_height)
-        self.send_gcode(gcode)
+        self.move_to_position(start_x, start_y, z_height)
         time.sleep(1)  # Give time to reach the starting position
         
         # Generate and execute the spiral path
@@ -379,11 +310,8 @@ class DeltaRobot:
             x = radius * math.cos(angle)
             y = radius * math.sin(angle)
             
-            # Calculate motor positions via inverse kinematics
-            gcode = self.calculate_motor_positions(x, y, z_height)
-            
-            # Send the command
-            self.send_gcode(gcode)
+            # Move to the position
+            self.move_to_position(x, y, z_height)
             
             # Wait for the specified delay
             time.sleep(delay)
@@ -441,11 +369,8 @@ class DeltaRobot:
             x = (width/2) * math.sin(t)
             y = (height/2) * math.sin(t) * math.cos(t)
             
-            # Calculate motor positions via inverse kinematics
-            gcode = self.calculate_motor_positions(x, y, z_height)
-            
-            # Send the command
-            self.send_gcode(gcode)
+            # Move to the position
+            self.move_to_position(x, y, z_height)
             
             # Wait for the specified delay
             time.sleep(delay)
@@ -456,6 +381,73 @@ class DeltaRobot:
                 print(f"Progress: {progress:.1f}% complete")
         
         print("Figure-eight movement completed")
+    
+    def move_in_3d_spiral(self, radius: float, start_z: float, end_z: float, 
+                         steps: int = 200, revolutions: float = 3.0, delay: float = 0.05):
+        """
+        Move the end effector in a 3D spiral path, changing height as it rotates.
+        
+        Args:
+            radius (float): Radius of the spiral in mm
+            start_z (float): Starting Z height for the spiral movement
+            end_z (float): Ending Z height for the spiral movement
+            steps (int): Number of steps to complete the spiral
+            revolutions (float): Number of complete revolutions to perform
+            delay (float): Delay between steps in seconds
+        """
+        if not self.serial_connection:
+            print("Serial connection not established. Connect first.")
+            return
+            
+        # Safety check - make sure the requested spiral is within the work envelope
+        if radius > self.xy_radius_at_z0 or start_z < self.z_min or start_z > self.z_max or end_z < self.z_min or end_z > self.z_max:
+            print(f"WARNING: Requested 3D spiral may be outside work envelope.")
+            print(f"Maximum recommended radius at z=0: {self.xy_radius_at_z0:.2f}mm")
+            print(f"Z range: {self.z_min:.2f}mm to {self.z_max:.2f}mm")
+            response = input("Continue anyway? (y/n): ")
+            if response.lower() != 'y':
+                return
+        
+        print(f"Moving in a 3D spiral with radius {radius}mm from z={start_z}mm to z={end_z}mm")
+        print(f"Performing {revolutions} revolutions with {steps} steps")
+        
+        # Home the machine first
+        self.send_gcode("G28")  # Home all axes
+        time.sleep(1)
+        
+        # Initial move to the starting position of the spiral
+        start_x = radius  # Start at (radius, 0)
+        start_y = 0
+        self.move_to_position(start_x, start_y, start_z)
+        time.sleep(1)  # Give time to reach the starting position
+        
+        # Calculate total number of steps
+        total_steps = int(steps * revolutions)
+        
+        # Generate and execute the 3D spiral path
+        for i in range(total_steps + 1):  # +1 to complete the path
+            # Calculate the angle for this step
+            angle = 2 * math.pi * i / steps
+            
+            # Calculate position on the spiral
+            x = radius * math.cos(angle)
+            y = radius * math.sin(angle)
+            
+            # Calculate z position - linear interpolation from start_z to end_z
+            z = start_z + (end_z - start_z) * (i / total_steps)
+            
+            # Move to the position
+            self.move_to_position(x, y, z)
+            
+            # Wait for the specified delay
+            time.sleep(delay)
+            
+            # Print progress every 10%
+            if i % (total_steps // 10) == 0 or i == total_steps:
+                progress = (i / total_steps) * 100
+                print(f"Progress: {progress:.1f}% complete")
+        
+        print("3D spiral movement completed")
     
     def close(self):
         """Close the serial connection."""
@@ -473,32 +465,34 @@ if __name__ == "__main__":
         upper_base_radius=190.0,  # 190mm upper support radius 
         effector_radius=70.0,     # 70mm end effector radius
         initial_angle=math.pi/4,  # 45 degrees initial angle
-        motor_min_rot=0.0,        # Min motor rotation
-        motor_max_rot=0.5         # Max motor rotation
+        motor_min_angle=-30.0 * (math.pi / 180.0),  # -30 degrees
+        motor_max_angle=30.0 * (math.pi / 180.0)    # +30 degrees
     )
     
     # Connect to the CNC shield via serial
-    if delta.connect_serial():
+    port = input("Enter serial port (default: /dev/ttyACM0): ") or "/dev/ttyACM0"
+    
+    if delta.connect_serial(port=port):
         try:
             print("Choose a movement pattern:")
-            print("1. Step-by-step circle (more precise)")
-            print("2. Smooth circle (using G2/G3 commands - smoother but requires arc support in controller)")
-            print("3. Spiral (inner to outer)")
-            print("4. Figure-eight pattern")
+            print("1. Circle")
+            print("2. Spiral")
+            print("3. Figure-eight")
+            print("4. 3D spiral")
             choice = input("Enter your choice (1-4): ")
             
             # Default Z height in the middle of the work envelope
             z_height = (delta.z_min + delta.z_max) / 2
             
             if choice == "1":
-                # Step-by-step circle parameters
+                # Circle parameters
                 circle_radius = float(input("Enter circle radius in mm (recommended: 100): ") or "100")
                 z_height = float(input(f"Enter Z height in mm (recommended: {z_height:.1f}): ") or f"{z_height}")
                 steps_per_rev = int(input("Enter steps per revolution (recommended: 60): ") or "60")
                 num_revolutions = float(input("Enter number of revolutions (recommended: 3): ") or "3")
                 step_delay = float(input("Enter delay between steps in seconds (recommended: 0.1): ") or "0.1")
                 
-                print("\nStarting step-by-step circular movement...")
+                print("\nStarting circular movement...")
                 # Execute the circular movement
                 delta.move_in_circle(
                     radius=circle_radius,
@@ -509,22 +503,6 @@ if __name__ == "__main__":
                 )
                 
             elif choice == "2":
-                # Smooth circle parameters
-                circle_radius = float(input("Enter circle radius in mm (recommended: 100): ") or "100")
-                z_height = float(input(f"Enter Z height in mm (recommended: {z_height:.1f}): ") or f"{z_height}")
-                feed_rate = float(input("Enter feed rate in mm/min (recommended: 600): ") or "600")
-                num_revolutions = float(input("Enter number of revolutions (recommended: 3): ") or "3")
-                
-                print("\nStarting smooth circular movement...")
-                # Execute the smooth circular movement
-                delta.move_in_smooth_circle(
-                    radius=circle_radius,
-                    z_height=z_height,
-                    feed_rate=feed_rate,
-                    revolutions=num_revolutions
-                )
-                
-            elif choice == "3":
                 # Spiral parameters
                 start_radius = float(input("Enter starting radius in mm (recommended: 20): ") or "20")
                 end_radius = float(input("Enter ending radius in mm (recommended: 150): ") or "150")
@@ -544,7 +522,7 @@ if __name__ == "__main__":
                     delay=delay
                 )
                 
-            elif choice == "4":
+            elif choice == "3":
                 # Figure-eight parameters
                 width = float(input("Enter figure-eight width in mm (recommended: 200): ") or "200")
                 height = float(input("Enter figure-eight height in mm (recommended: 100): ") or "100")
@@ -564,6 +542,26 @@ if __name__ == "__main__":
                     delay=delay
                 )
                 
+            elif choice == "4":
+                # 3D spiral parameters
+                radius = float(input("Enter spiral radius in mm (recommended: 100): ") or "100")
+                start_z = float(input(f"Enter starting Z height in mm (recommended: {delta.z_min * 0.7:.1f}): ") or f"{delta.z_min * 0.7}")
+                end_z = float(input(f"Enter ending Z height in mm (recommended: {delta.z_max * 0.7:.1f}): ") or f"{delta.z_max * 0.7}")
+                steps = int(input("Enter steps per revolution (recommended: 50): ") or "50")
+                revolutions = float(input("Enter number of revolutions (recommended: 3): ") or "3")
+                delay = float(input("Enter delay between steps in seconds (recommended: 0.05): ") or "0.05")
+                
+                print("\nStarting 3D spiral movement...")
+                # Execute the 3D spiral movement
+                delta.move_in_3d_spiral(
+                    radius=radius,
+                    start_z=start_z,
+                    end_z=end_z,
+                    steps=steps,
+                    revolutions=revolutions,
+                    delay=delay
+                )
+                
             else:
                 print("Invalid choice. Exiting.")
             
@@ -572,89 +570,4 @@ if __name__ == "__main__":
         finally:
             delta.close()
     else:
-        # If serial connection fails, just demonstrate some positions
-        print("Serial connection failed. Demonstrating path points:")
-        
-        # Choose a default pattern to demonstrate
-        print("Choose a pattern to demonstrate:")
-        print("1. Circle")
-        print("2. Spiral")
-        print("3. Figure-eight")
-        demo_choice = input("Enter your choice (1-3): ") or "1"
-        
-        # Default Z height in the middle of the work envelope
-        z_height = (delta.z_min + delta.z_max) / 2
-        steps = 12  # Number of points to show for demo
-        
-        if demo_choice == "2":
-            # Spiral demo
-            start_radius = 20.0
-            end_radius = 150.0
-            
-            print(f"\nDemonstrating points along a spiral from radius {start_radius}mm to {end_radius}mm at height {z_height:.1f}mm:")
-            for i in range(steps):
-                # Calculate point along spiral
-                angle = 2 * math.pi * i / steps
-                radius = start_radius + (end_radius - start_radius) * i / steps
-                
-                x = radius * math.cos(angle)
-                y = radius * math.sin(angle)
-                
-                # Calculate motor positions
-                motor_pos = delta.inverse_kinematics(x, y, z_height)
-                
-                print(f"Spiral point {i+1}/{steps}: End effector at X={x:.2f}, Y={y:.2f}, Z={z_height:.2f}")
-                print(f"Motor positions: X={motor_pos[0]:.4f}, Y={motor_pos[1]:.4f}, Z={motor_pos[2]:.4f}")
-                print(f"G-code: G1 X{motor_pos[0]:.4f} Y{motor_pos[1]:.4f} Z{motor_pos[2]:.4f} F1000")
-                print("-" * 40)
-                
-        elif demo_choice == "3":
-            # Figure-eight demo
-            width = 200.0
-            height = 100.0
-            
-            print(f"\nDemonstrating points along a figure-eight with width {width}mm and height {height}mm at z={z_height:.1f}mm:")
-            for i in range(steps):
-                # Calculate point along figure-eight
-                t = 2 * math.pi * i
-                            # Figure-eight demo
-            width = 200.0
-            height = 100.0
-            
-            print(f"\nDemonstrating points along a figure-eight with width {width}mm and height {height}mm at z={z_height:.1f}mm:")
-            for i in range(steps):
-                # Calculate point along figure-eight
-                t = 2 * math.pi * i / steps
-                
-                x = (width/2) * math.sin(t)
-                y = (height/2) * math.sin(t) * math.cos(t)
-                
-                # Calculate motor positions
-                motor_pos = delta.inverse_kinematics(x, y, z_height)
-                
-                print(f"Figure-eight point {i+1}/{steps}: End effector at X={x:.2f}, Y={y:.2f}, Z={z_height:.2f}")
-                print(f"Motor positions: X={motor_pos[0]:.4f}, Y={motor_pos[1]:.4f}, Z={motor_pos[2]:.4f}")
-                print(f"G-code: G1 X{motor_pos[0]:.4f} Y{motor_pos[1]:.4f} Z{motor_pos[2]:.4f} F1000")
-                print("-" * 40)
-                
-        else:
-            # Default to circle demo
-            radius = 100.0
-            
-            print(f"\nDemonstrating points along a circle of radius {radius}mm at height {z_height:.1f}mm:")
-            for i in range(steps):
-                # Calculate point along circle
-                angle = 2 * math.pi * i / steps
-                
-                x = radius * math.cos(angle)
-                y = radius * math.sin(angle)
-                
-                # Calculate motor positions
-                motor_pos = delta.inverse_kinematics(x, y, z_height)
-                
-                print(f"Circle point {i+1}/{steps}: End effector at X={x:.2f}, Y={y:.2f}, Z={z_height:.2f}")
-                print(f"Motor positions: X={motor_pos[0]:.4f}, Y={motor_pos[1]:.4f}, Z={motor_pos[2]:.4f}")
-                print(f"G-code: G1 X{motor_pos[0]:.4f} Y{motor_pos[1]:.4f} Z{motor_pos[2]:.4f} F1000")
-                print("-" * 40)
-
-
+        print("Failed to connect to serial port. Check your connections and try again.")
